@@ -1,4 +1,14 @@
-# Fully differentiable 2D cellular potts model powered by JAX
+"""Fully differentiable 2D cellular potts model powered by JAX
+
+This script implements a basic cellular Potts model (c.f. e.g. 
+https://en.wikipedia.org/wiki/Cellular_Potts_model). The example system simulated is
+taken from the examples from the (far more sophisticated) "compucell3D" project. What
+compucell3D lacks however is the fact that the algorithm in the form presented here is
+fully differentiable (within the bounds of the JAX framework). So, albeit probably
+slower than the state-of-the-art counter part, a simulation like this could potentially
+have benefits to machine learning applications.
+"""
+
 
 from dataclasses import dataclass
 from functools import partial
@@ -66,6 +76,19 @@ def cell_interaction_energy(
     x: int,
     y: int,
 ) -> float:
+    """Compute the interaction energy of a cell with its neighbours
+
+    Args:
+        cell_id: The id of the cell
+        cell_type: The type of the cell
+        grid: The current system state
+        cell_types: The cell types of the cells in the system
+        J: The interaction matrix between cell types
+        V: The target volume of the cells
+        lambda_v: The volume constraint strength
+        x: The x coordinate of the cell
+        y: The y coordinate of the cell
+    """
     energy = 0
     energy += np.where(
         np.logical_and(x > 0, cell_id != grid[x - 1, y]),
@@ -102,20 +125,29 @@ def hamiltonian(
     """Compute the energy of the system
 
     Args:
-        system: The current system state
+        grid: The current system state
+        cell_types: Mapping of cell-ids to cell types (i. e. 0, 1 or 2)
         J: The interaction matrix between cell types
         V: The target volume of the cells
         lambda_v: The volume constraint strength
         n_cells: The number of cells in the system
     """
-    cell_types = cell_types[grid]
+    cell_types_grid = cell_types[grid]
     energy = 0
 
     # Interaction energy
     @jit
     def energy_fn(x, y):
         return cell_interaction_energy(
-            grid[x, y], cell_types[x, y], grid, cell_types, J, V, lambda_v, x, y
+            grid[x, y],
+            cell_types_grid[x, y],
+            grid,
+            cell_types_grid,
+            J,
+            V,
+            lambda_v,
+            x,
+            y,
         )
 
     xx, yy = np.meshgrid(np.arange(grid.shape[0]), np.arange(grid.shape[1]))
@@ -191,6 +223,19 @@ def delta_energy(
 def propose_flip(
     key, grid: np.ndarray, cell_types: np.ndarray
 ) -> tuple[np.ndarray, int, int, int]:
+    """Propose a cell to flip
+
+    Args:
+        key: The random number generator key
+        grid: The current system state
+        cell_types: The cell types of the cells in the system
+
+    Returns:
+        key: The random number generator key
+        x: The x coordinate of the cell to flip
+        y: The y coordinate of the cell to flip
+        new_cell_id: The cell id of the cell to flip
+    """
     # select a random cell
     x = -1
     y = -1
@@ -235,6 +280,14 @@ def propose_flip(
 
 @jit
 def accept_flip(grid: np.ndarray, flip_x, flip_y, new_cell_id) -> np.ndarray:
+    """Accept a proposed flip, i. e. alter the system state by flipping a cell
+
+    Args:
+        grid: The current system state
+        flip_x: The x coordinate of the cell to flip
+        flip_y: The y coordinate of the cell to flip
+        new_cell_id: The cell id of the cell to flip
+    """
     return grid.at[flip_x, flip_y].set(new_cell_id)
 
 
@@ -247,14 +300,30 @@ def mc_sweep(
     J: np.ndarray,
     V: float,
     lambda_v: float,
-    TEMPERATURE: float,
+    temperature: float,
 ):
+    """Perform a Monte-Carlo sweep
+
+    Perform as many single Monte-Carlo steps as there are sites ("pixels") in the
+    system.
+
+    Args:
+        key: The random number generator key
+        grid: The current system state
+        energy: The current value of the hamiltonian
+        cell_types: Mapping of cell-ids to cell types (i. e. 0, 1 or 2)
+        J: The interaction matrix between cell types
+        V: The target volume of the cells
+        lambda_v: The volume constraint strength
+        temperature: The system temperature
+    """
+
     def negative_de(key, x, y, new_cell_id, grid, de):
         return key, accept_flip(grid, x, y, new_cell_id), de
 
     def positive_de(key, x, y, new_cell_id, grid, de):
         key, subkey = jax.random.split(key)
-        randn = jax.random.uniform(subkey) - np.exp(-de / TEMPERATURE)
+        randn = jax.random.uniform(subkey) - np.exp(-de / temperature)
         return key, np.where(
             randn < 0,
             accept_flip(grid, x, y, new_cell_id),
@@ -276,69 +345,66 @@ def mc_sweep(
         0, grid.shape[0] * grid.shape[1], loop_body, (key, grid, energy)
     )
 
+    # DEBUG: Check that the continuously updated energy matches the hamiltonian
+    #
     # for i in range(grid.shape[0] * grid.shape[1]):
     # if de < 0:
     #     grid = np.where(de < 0, accept_flip(grid, x, y, new_cell_id), grid)
     #     energy += np.where(de < 0, de, 0)
     # else:
     #     key, subkey = jax.random.split(key)
-    #     if jax.random.uniform(subkey) < np.exp(-de / TEMPERATURE):
+    #     if jax.random.uniform(subkey) < np.exp(-de / temperature):
     #         grid = accept_flip(grid, x, y, new_cell_id)
     #         energy += de
     return grid, energy
 
 
-J = np.array(
-    [
-        [0, 16, 16],
-        [16, 2, 11],
-        [16, 11, 16],
-    ]
-)
+def main():
+    # JAX RNG
+    SEED = 123
+    key = jax.random.PRNGKey(SEED)
 
-V = 25
-lambda_v = 2
-TEMPERATURE = 10
+    # System constants, taken from
+    # https://github.com/CompuCell3D/CompuCell3D/tree/master/CompuCell3D/core/Demos/cellsort_project_py_step_new_style
+    J = np.array(
+        [
+            [0, 16, 16],
+            [16, 2, 11],
+            [16, 11, 16],
+        ]
+    )  # Interaction matrix
+    V = 25  # Target volume
+    lambda_v = 2  # volume constraint
+    temperature = 10
 
-key = jax.random.PRNGKey(123)
+    system = setup()
+    n_cells = int(np.max(system.grid))
 
+    energy = hamiltonian(system.grid, system.cell_types, J, V, lambda_v, n_cells)
+    start_energy = energy
 
-system = setup()
-n_cells = int(np.max(system.grid))
-energy = hamiltonian(system.grid, system.cell_types, J, V, lambda_v, n_cells)
-start_energy = energy
+    plt.ion()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    img = ax.imshow(np.asarray(system.cell_types[system.grid]))
+    # img = ax.imshow(np.asarray(system.grid))
 
-plt.ion()
+    for i in range(1000):
+        system.grid, energy = mc_sweep(
+            key, system.grid, energy, system.cell_types, J, V, lambda_v, temperature
+        )
+        img.set_data(np.asarray(system.cell_types[system.grid]))
+        # img.set_data(np.asarray(system.grid))
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        print(f"Energy: {energy}")
 
-fig = plt.figure()
-ax = fig.add_subplot(111)
-# img = ax.imshow(np.asarray(system.cell_types[system.grid]))
-img = ax.imshow(np.asarray(system.grid))
-
-for i in range(10):
-    system.grid, energy = mc_sweep(
-        key, system.grid, energy, system.cell_types, J, V, lambda_v, TEMPERATURE
+    print(f"Start energy: {start_energy}")
+    print(f"Energy from de: {energy}")
+    print(
+        f"Energy from hamiltonian: {hamiltonian(system.grid, system.cell_types, J, V, lambda_v, n_cells)}"
     )
-    img.set_data(np.asarray(system.grid))
-    fig.canvas.draw()
-    fig.canvas.flush_events()
-    print(f"Energy: {energy}")
-    onp.savetxt(f"grid_{i}.txt", np.asarray(system.grid), fmt="%d")
 
 
-print(f"Start energy: {start_energy}")
-print(f"Energy from de: {energy}")
-print(
-    f"Energy from hamiltonian: {hamiltonian(system.grid, system.cell_types, J, V, lambda_v, n_cells)}"
-)
-
-# system = setup()
-# x = 20
-# y = 20
-# new_cell_id = 0
-# energy_start = hamiltonian(system.grid, system.cell_types, J, V, lambda_v, n_cells)
-# de = delta_energy(system.grid, system.cell_types, x, y, new_cell_id, J, V, lambda_v)
-# system.grid = accept_flip(system.grid, x, y, new_cell_id)
-# energy_end = hamiltonian(system.grid, system.cell_types, J, V, lambda_v, n_cells)
-# print(f"denergy: {de}")
-# print(f"denergy hamiltonian: {energy_end - energy_start}")
+if __name__ == "__main__":
+    main()
